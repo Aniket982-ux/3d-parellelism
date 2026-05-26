@@ -1,0 +1,23 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Training artifacts (checkpoints, tokenizers, logs)
+*.pt
+*.json
+runs/
+weights/
+opus_books_weights/
+wandb/
+
+# Notebooks & legacy files
+*.ipynb
+conda.txt
+
+# OS junk
+.DS_Store
+Thumbs.db
