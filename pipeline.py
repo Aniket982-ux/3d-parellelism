@@ -248,6 +248,14 @@ def pipeline_forward_backward(
 
             loss.backward()
 
+            # Guard: if grad is None the decoder's cross-attention did not
+            # flow gradients back through encoder_output (broken compute graph).
+            if encoder_output.grad is None:
+                raise RuntimeError(
+                    f"[PP Rank 1 | MB {mb_idx}] encoder_output.grad is None after "
+                    "backward. Cross-attention must use encoder_output in the "
+                    "forward pass and requires_grad_(True) must be set before it."
+                )
             # Send encoder_output.grad back to Stage 0
             grad = encoder_output.grad.contiguous()
             if os.environ.get("DEBUG_PP") == "1":

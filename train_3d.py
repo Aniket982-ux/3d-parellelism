@@ -17,7 +17,7 @@ Usage (local smoke test, 1 GPU):
 
 from model import build_transformer
 from dataset import BilingualDataset, causal_mask
-from config import get_config, get_weights_file_path, latest_weights_file_path
+from config import get_config, get_datasource_slug, get_weights_file_path, latest_weights_file_path
 from pipeline import (
     split_model_into_stages,
     pipeline_forward_backward,
@@ -26,17 +26,18 @@ from pipeline import (
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader, random_split
 
 import warnings
 from tqdm import tqdm
 import os
 from pathlib import Path
+from datetime import timedelta
 
 # Distributed training (3D Parallelism APIs)
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
@@ -51,6 +52,100 @@ from tokenizers.pre_tokenizers import Whitespace
 
 import torchmetrics
 import wandb
+
+
+def resolve_model_folder(config):
+    model_folder_path = Path(config['model_folder'])
+    if model_folder_path.is_absolute():
+        return model_folder_path
+    return Path(".") / f"{get_datasource_slug(config)}_{config['model_folder']}"
+
+
+def log_startup_summary(
+    backend,
+    config,
+    global_rank,
+    world_size,
+    local_world_size,
+    requested_topology,
+    resolved_topology,
+    model_folder_path,
+):
+    if global_rank != 0:
+        return
+
+    print("=" * 72)
+    print("3D training startup summary")
+    print(
+        f"backend={backend} | world_size={world_size} | "
+        f"local_world_size={local_world_size} | multi_node={world_size > local_world_size}"
+    )
+    print(
+        "requested topology="
+        f"TP={requested_topology[0]} PP={requested_topology[1]} DP={requested_topology[2]} | "
+        "resolved topology="
+        f"TP={resolved_topology[0]} PP={resolved_topology[1]} DP={resolved_topology[2]}"
+    )
+    print(
+        f"batch_size={config['batch_size']} | num_microbatches={config['num_microbatches']} | "
+        f"preload={config['preload']}"
+    )
+    print(f"checkpoint_dir={model_folder_path}")
+    print(
+        f"MASTER_ADDR={os.environ.get('MASTER_ADDR', '<unset>')} | "
+        f"MASTER_PORT={os.environ.get('MASTER_PORT', '<unset>')}"
+    )
+    if backend == 'nccl':
+        print(
+            f"NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', '<unset>')} | "
+            f"NCCL_IB_DISABLE={os.environ.get('NCCL_IB_DISABLE', '<unset>')} | "
+            f"NCCL_ASYNC_ERROR_HANDLING={os.environ.get('NCCL_ASYNC_ERROR_HANDLING', '<unset>')}"
+        )
+    print("=" * 72)
+
+
+def maybe_log_dp_sync_debug(model, dp_mesh, dp_size, global_rank, pp_rank, tp_rank, global_step):
+    if os.environ.get("DEBUG_DP_SYNC") != "1":
+        return
+    if dp_size <= 1 or global_step != 0:
+        return
+
+    param_name = None
+    local_grad = None
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grad = param.grad
+        if hasattr(grad, "to_local"):
+            local_grad = grad.to_local().detach().cpu().contiguous()
+        else:
+            local_grad = grad.detach().cpu().contiguous()
+        param_name = name
+        break
+
+    if local_grad is None:
+        if dp_mesh.get_local_rank() == 0:
+            print(
+                f"[DP Sync Debug] step={global_step} global_rank={global_rank} "
+                f"pp_rank={pp_rank} tp_rank={tp_rank}: no gradients were found."
+            )
+        return
+
+    gathered = [torch.empty_like(local_grad) for _ in range(dp_size)]
+    dist.all_gather(gathered, local_grad, group=dp_mesh.get_group())
+    max_diff = max((gathered[0] - other).abs().max().item() for other in gathered[1:]) if len(gathered) > 1 else 0.0
+
+    if dp_mesh.get_local_rank() == 0:
+        print(
+            f"[DP Sync Debug] step={global_step} global_rank={global_rank} "
+            f"pp_rank={pp_rank} tp_rank={tp_rank} param={param_name} "
+            f"max_grad_diff_across_dp={max_diff:.3e}"
+        )
+        if max_diff > 1e-6:
+            print(
+                "[DP Sync Debug] WARNING: DP replicas still differ after backward. "
+                "This usually means the PP path did not trigger DDP gradient synchronization."
+            )
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
@@ -181,9 +276,17 @@ def get_ds(config, dp_size, dp_rank):
     # It only has the train split, so we divide it ourselves
     ds_raw = load_dataset(f"{config['datasource']}", f"{config['lang_src']}-{config['lang_tgt']}", split='train')
 
-    # Build tokenizers
-    tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
-    tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config['lang_tgt'])
+    # Build tokenizers — only rank 0 writes to avoid concurrent writes on the
+    # shared CIFS filesystem. Concurrent writes from 8 ranks to the same
+    # tokenizer JSON file will corrupt it. Other ranks wait at the barrier,
+    # then load the already-written files.
+    if dist.get_rank() == 0:
+        tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
+        tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config['lang_tgt'])
+    dist.barrier()
+    if dist.get_rank() != 0:
+        tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
+        tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config['lang_tgt'])
 
     # Keep 90% for training, 10% for validation
     train_ds_size = int(0.9 * len(ds_raw))
@@ -261,23 +364,45 @@ def get_model(config, vocab_src_len, vocab_tgt_len):
 
 def train_model(config):
     # Setup distributed training
-    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-    init_process_group(backend=backend)
+    backend = os.environ.get('DIST_BACKEND', 'nccl' if torch.cuda.is_available() else 'gloo')
+    # timeout covers collective ops (all_reduce, barrier) across DP/TP groups.
+    # Note: P2P ops (dist.send/recv in pipeline.py) are NOT bounded by this
+    # timeout — they require NCCL_ASYNC_ERROR_HANDLING or a watchdog separately.
+    init_process_group(backend=backend, timeout=timedelta(minutes=10))
     
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     global_rank = int(os.environ.get('RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
+    local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', world_size))
     
     tp_size = config.get('tp_size', 1)
     pp_size = config.get('pp_size', 1)
     dp_size = config.get('dp_size', 1)
     num_microbatches = config.get('num_microbatches', 2)
+    requested_tp_size = tp_size
+    requested_pp_size = pp_size
+    requested_dp_size = dp_size
     
     # Validation for local smoke testing
     if world_size != tp_size * pp_size * dp_size:
         if global_rank == 0:
             print(f"Warning: WORLD_SIZE ({world_size}) != tp({tp_size}) * pp({pp_size}) * dp({dp_size}). Forcing tp=1, pp=1, dp=1 for local testing.")
         tp_size = pp_size = dp_size = 1
+
+    if pp_size > 1 and config['batch_size'] % num_microbatches != 0:
+        raise ValueError(
+            f"batch_size ({config['batch_size']}) must be divisible by num_microbatches "
+            f"({num_microbatches}) when pipeline parallelism is enabled."
+        )
+
+    raw_model_folder = Path(config['model_folder'])
+    is_multi_node = world_size > local_world_size
+    if is_multi_node and not raw_model_folder.is_absolute():
+        raise RuntimeError(
+            "Multi-node training requires config['model_folder'] to be a shared absolute path "
+            "such as /mnt/training-data/weights. Set MODEL_FOLDER=/mnt/training-data/weights "
+            "or update config.py before launching."
+        )
 
     assert pp_size <= 2, f"Pipeline size (pp_size) must be <= 2 since the model naturally splits into exactly 2 stages (Encoder/Decoder). Got {pp_size}."
 
@@ -301,10 +426,22 @@ def train_model(config):
     pp_mesh = mesh["pp"]
     dp_mesh = mesh["dp"]
     
+    tp_rank = tp_mesh.get_local_rank()
     pp_rank = pp_mesh.get_local_rank()
     pp_group = pp_mesh.get_group()
     dp_rank = dp_mesh.get_local_rank()
-    
+
+    # In PP mode the loss lives only on the last PP stage (pp_rank == pp_size-1).
+    # global_rank==0 is always the encoder stage (pp_rank=0) and never has the
+    # loss, so using it for W&B logging silently logs nothing in PP mode.
+    # is_logging_rank picks the single rank that both owns the loss and does
+    # all W&B calls, keeping wandb.init() and wandb.log() on the same rank.
+    is_logging_rank = (
+        (pp_size <= 1 and global_rank == 0) or
+        (pp_size > 1 and pp_rank == pp_size - 1
+            and dp_rank == 0 and tp_rank == 0)
+    )
+
     # Define the device
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -314,17 +451,34 @@ def train_model(config):
     
     print(
         f"Rank {global_rank} | device={device} | "
-        f"TP_rank={tp_mesh.get_local_rank()}, "
+        f"TP_rank={tp_rank}, "
         f"PP_rank={pp_rank}, "
         f"DP_rank={dp_rank}"
     )
 
+    model_folder_path = resolve_model_folder(config)
+    log_startup_summary(
+        backend=backend,
+        config=config,
+        global_rank=global_rank,
+        world_size=world_size,
+        local_world_size=local_world_size,
+        requested_topology=(requested_tp_size, requested_pp_size, requested_dp_size),
+        resolved_topology=(tp_size, pp_size, dp_size),
+        model_folder_path=model_folder_path,
+    )
+    if global_rank == 0 and backend == 'nccl' and pp_size > 1 and os.environ.get('NCCL_ASYNC_ERROR_HANDLING') != '1':
+        print(
+            "Warning: NCCL_ASYNC_ERROR_HANDLING is not set to 1. "
+            "Pipeline send/recv hangs may not fail fast without it."
+        )
+
     # Make sure the weights folder exists (only on master node)
     if global_rank == 0:
-        model_folder_path = Path(config['model_folder'])
-        if not model_folder_path.is_absolute():
-            model_folder_path = Path(".") / f"{config['datasource']}_{config['model_folder']}"
         model_folder_path.mkdir(parents=True, exist_ok=True)
+    # Barrier: all ranks wait until rank 0 has created the folder on the shared
+    # filesystem before any rank attempts a DCP load or save.
+    dist.barrier()
 
     # FIX (Bug 1): Pass dp_size and dp_rank so only DP replicas split data
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config, dp_size, dp_rank)
@@ -366,8 +520,12 @@ def train_model(config):
         )
         stage = None  # signal: not using PP
     
-    # Weights & Biases initialization ONLY on master node
-    if global_rank == 0:
+    # Weights & Biases initialization — only on is_logging_rank.
+    # In non-PP mode this is rank 0. In PP mode it is the last PP stage's
+    # first DP/TP rank (the only rank that actually holds the loss value).
+    # wandb.init() and every wandb.log() must be on the same rank or wandb
+    # raises UsageError and crashes the process.
+    if is_logging_rank:
         wandb.init(project="pytorch-transformer", config=config)
         wandb.define_metric("global_step")
         wandb.define_metric("validation/*", step_metric="global_step")
@@ -450,7 +608,7 @@ def train_model(config):
                 
                 if pp_rank == pp_size - 1:
                     batch_iterator.set_postfix({"loss": f"{avg_loss:6.3f}"})
-                    if global_rank == 0:
+                    if is_logging_rank:
                         wandb.log({'train/loss': avg_loss, 'global_step': global_step})
                 
             else:
@@ -468,10 +626,20 @@ def train_model(config):
                 loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
                 batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
 
-                if global_rank == 0:
+                if is_logging_rank:
                     wandb.log({'train/loss': loss.item(), 'global_step': global_step})
 
                 loss.backward()
+
+            maybe_log_dp_sync_debug(
+                model=raw_model,
+                dp_mesh=dp_mesh,
+                dp_size=dp_size,
+                global_rank=global_rank,
+                pp_rank=pp_rank,
+                tp_rank=tp_rank,
+                global_step=global_step,
+            )
 
             # Update the weights (works for both PP and non-PP paths)
             optimizer.step()
@@ -508,5 +676,8 @@ def train_model(config):
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")
     config = get_config()
-    train_model(config)
-    destroy_process_group()
+    try:
+        train_model(config)
+    finally:
+        if dist.is_initialized():
+            destroy_process_group()

@@ -1,6 +1,10 @@
 # Use PyTorch 2.2+ for native DeviceMesh and Tensor Parallelism APIs
 torch>=2.2.0
-datasets>=2.15.0
+
+# Pin the HF dataset stack to the pair validated by the WSL smoke test.
+datasets==2.15.0
+huggingface-hub==0.23.0
+
 tokenizers>=0.13.3
 torchmetrics>=1.0.3
 tqdm>=4.65.0

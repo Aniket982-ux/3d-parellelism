@@ -1,18 +1,27 @@
-# Virtual environment
+# Virtual environments
+.venv/
 venv/
 
-# Python cache
+# Python cache and test cache
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
-# Training artifacts (checkpoints, tokenizers, logs)
+# Training artifacts
 *.pt
-*.json
+tokenizer_*.json
 runs/
 weights/
-opus_books_weights/
+*_weights/
 wandb/
+Helsinki-NLP/
+opus_books_./
+
+# Local distributed test scratch files
+tests/_gloo_store
+tests/_native_store
+/3d_parallelism_roadmap.md
 
 # Notebooks & legacy files
 *.ipynb
