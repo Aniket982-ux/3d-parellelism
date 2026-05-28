@@ -7,6 +7,11 @@ Parallelism, and Data Parallelism — running concurrently across 8 GPUs on
 implemented without Megatron, DeepSpeed, or any high-level training framework.
 Raw PyTorch APIs only.
 
+> **Deploying to the cloud?** See [cloud.md](cloud.md) for the complete
+> step-by-step Azure deployment runbook — VM selection, networking, driver
+> installation, Secure Boot gotchas, preflight checks, and the full launch
+> sequence.
+
 ---
 
 ## The Problem
