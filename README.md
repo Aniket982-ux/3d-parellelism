@@ -317,17 +317,16 @@ pp_group  = pp_mesh.get_group()               # ProcessGroup for P2P comms
 
 **Mesh Coordinate to Global Rank Mapping:**
 
-```mermaid
-classDiagram
-    class Rank0 { (DP=0, PP=0, TP=0) : Node 0, GPU 0 }
-    class Rank1 { (DP=0, PP=0, TP=1) : Node 0, GPU 1 }
-    class Rank2 { (DP=0, PP=1, TP=0) : Node 1, GPU 0 }
-    class Rank3 { (DP=0, PP=1, TP=1) : Node 1, GPU 1 }
-    class Rank4 { (DP=1, PP=0, TP=0) : Node 2, GPU 0 }
-    class Rank5 { (DP=1, PP=0, TP=1) : Node 2, GPU 1 }
-    class Rank6 { (DP=1, PP=1, TP=0) : Node 3, GPU 0 }
-    class Rank7 { (DP=1, PP=1, TP=1) : Node 3, GPU 1 }
-```
+| Global Rank | `(DP, PP, TP)` | Physical Location | Pipeline Stage |
+|:---:|:---:|:---|:---|
+| **0** | `(0, 0, 0)` | Node 0, GPU 0 | Encoder (Cluster 0) |
+| **1** | `(0, 0, 1)` | Node 0, GPU 1 | Encoder (Cluster 0) |
+| **2** | `(0, 1, 0)` | Node 1, GPU 0 | Decoder (Cluster 0) |
+| **3** | `(0, 1, 1)` | Node 1, GPU 1 | Decoder (Cluster 0) |
+| **4** | `(1, 0, 0)` | Node 2, GPU 0 | Encoder (Cluster 1) |
+| **5** | `(1, 0, 1)` | Node 2, GPU 1 | Encoder (Cluster 1) |
+| **6** | `(1, 1, 0)` | Node 3, GPU 0 | Decoder (Cluster 1) |
+| **7** | `(1, 1, 1)` | Node 3, GPU 1 | Decoder (Cluster 1) |
 
 This is why the architecture is topology-agnostic. Changing `TP_SIZE`,
 `PP_SIZE`, or `DP_SIZE` via environment variables reshapes the mesh and
