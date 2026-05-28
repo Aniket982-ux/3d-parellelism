@@ -1,5 +1,9 @@
-# Use PyTorch 2.2+ for native DeviceMesh and Tensor Parallelism APIs
-torch>=2.2.0
+# PyTorch 2.2+ required for native DeviceMesh, DCP, and Tensor Parallel
+# Specifying cu121 to support Azure NCasT4_v3 driver 535 (CUDA 12.2)
+torch==2.2.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+
+# PyTorch 2.2 C extensions require NumPy 1.x ABI to prevent initialization errors
+numpy<2
 
 # Pin the HF dataset stack to the pair validated by the WSL smoke test.
 datasets==2.15.0

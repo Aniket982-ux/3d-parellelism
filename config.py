@@ -35,7 +35,7 @@ def get_config():
         "d_model": 512,         # Transformer hidden dimension
         "seq_len": 350,         # Max token sequence length
         "batch_size": _env_int("BATCH_SIZE", 8),        # Per-DP-replica batch size
-        "num_epochs": _env_int("NUM_EPOCHS", 20),
+        "num_epochs": _env_int("NUM_EPOCHS", 5),
         "lr": _env_float("LR", 1e-4),
 
         # -----------------------------------------------------------------------
