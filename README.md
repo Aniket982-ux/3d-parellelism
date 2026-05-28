@@ -502,8 +502,20 @@ NCCL_SOCKET_IFNAME=eth0 | NCCL_IB_DISABLE=1
   state across all 8 ranks to a single Azure Files share; `FileSystemReader`
   reloading correctly on resume
 - **Full epoch completion** — 1819/1819 steps per epoch with loss decreasing
-  monotonically across epochs; W&B run tracked at project
-  `pytorch-transformer`
+  monotonically across epochs
+- **W&B run tracking** — Weights & Biases logged every training step from
+  global rank 0: `train/loss`, `global_step`, and full system metrics (GPU
+  memory clock, SM utilization, power draw). Loss opened near random-weight
+  cross-entropy over the target vocabulary and descended steadily through
+  the full epoch, confirming all 8 ranks were computing and synchronizing
+  gradients correctly.
+- **Distributed checkpointing** — DCP `FileSystemWriter` saves the model
+  state in shards, one file per rank, to the shared Azure Files drive after
+  every epoch. Because cloud Spot VMs can be preempted at any time, this is
+  the only way to guarantee training can be resumed from exactly where it
+  stopped without losing progress. On resume, `FileSystemReader` reloads
+  each rank's shard independently without any rank needing to hold the full
+  model in memory.
 
 ### Run Screenshots
 
